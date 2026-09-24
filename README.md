@@ -1,640 +1,1203 @@
-# Parfocal: System Design Draft 2
+# Panel + Daemon — System Design (Draft 2, Elaborated)
 
-**Working title:** a modern, extensible Cockpit-style server management panel
-**Status:** Draft v0.2
-**Stack:** Go (backend and SSR UI) · PostgreSQL · systemd/D-Bus · polkit · sandboxed addons
-**License:** GNU GPL v2 (see section 15 for two things to decide)
-**Distribution:** tarball
+> **Naming disclaimer:** Every proper noun in this document — `panel`, `daemon`, `tmz`, `.tmz`, `.tmz.sc`, `Location`, `Node`, route names, table names, binary names — is a working placeholder. Nothing here is final naming. Field names inside schemas are illustrative and meant to be refined during implementation, not copied verbatim.
 
-### Changes since v0.1
-
-| Area | v0.1 | v0.2 |
-|---|---|---|
-| Database | SQLite | **PostgreSQL** (master and standalone modes) |
-| UI rendering | Static Astro build | **Server-side rendered by Go**, over TLS |
-| Deployment | Single host | **Three modes: standalone, master, node** |
-| Addon presentation | One model | **Embedded tool or separate site**, declared in manifest |
-| Addon UI | Raw web tech only | **UI API mode or custom-components mode** (mutually exclusive) |
-| Addon interaction | None | **Only via declared dependencies** |
-| Authorization | Unix group + capabilities | **polkit** as the source of roles and privileged-action decisions |
-| Sessions | Generic | **1 hour idle timeout for web sessions; terminal sessions exempt** |
-| Audit | Privileged actions | **Every action** |
-| Packaging | Unspecified | **Tarball**, GPL v2 |
+> **Purpose of this document:** a single, comprehensive reference for the whole system as discussed so far — architecture, data model, protocols, and the reasoning behind each decision — so that implementation can start from something concrete instead of scattered notes. Sections marked **[OPEN]** are explicitly undecided and flagged rather than silently resolved.
 
 ---
 
-## 1. Summary
+## Table of contents
 
-A web panel for managing Linux servers (services, logs, terminal, files, storage, networking, containers) built on systemd and D-Bus, with three goals:
-
-1. **A better UI:** modern, fast, consistent, server-rendered.
-2. **A first-class addon system:** addons are sandboxed processes with either a declarative UI or fully custom UI, able to depend on each other.
-3. **A hard permission boundary:** addons do only what their granted capabilities allow and never more than the user could do, unless a high-ranking user explicitly enables *direct access*.
-
-**One binary, three roles.** The same Go program runs as a *standalone* panel for its own host, as a *node* that takes orders from a master, or as a *master* that serves the UI and relays work to nodes.
-
-### Non-goals (v1)
-
-- Non-systemd distributions (the design deliberately relies on systemd and D-Bus)
-- Multi-tenant hosting
-- High-availability master (designed for, not built)
-- Matching Cockpit's full module breadth on day one
-
----
-
-## 2. Requirements
-
-### 2.1 Functional
-
-| # | Requirement |
-|---|---|
-| F1 | Log in with existing Unix accounts via PAM |
-| F2 | Manage systemd units (list, status, start/stop/restart, enable/disable) |
-| F3 | Live journal log streaming with filtering |
-| F4 | Browser terminal |
-| F5 | File browser with resumable upload/download |
-| F6 | Live metrics |
-| F7 | Install, update, enable, disable, remove addons |
-| F8 | Addons run as either a custom tool inside the panel or a separate site alongside it, per manifest |
-| F9 | Addon UI via the manifest UI API, or custom components with author-defined routes |
-| F10 | Addons call system functions only through the capability-checked API |
-| F11 | Addons call other addons only if they declare them as dependencies |
-| F12 | Opt-in direct access for addons, restricted to high-ranking users, with warning and legal notice on every enable |
-| F13 | Web sessions expire after 1 hour idle; terminal sessions do not |
-| F14 | Run as standalone, node, or master |
-| F15 | Master manages nodes: enrollment, command relay, UI for any node |
-| F16 | Audit log entry for every action |
-| F17 | Everything the UI does is available through the public API |
-
-### 2.2 Non-functional (assumptions)
-
-| Area | Target |
-|---|---|
-| Users | 1–20 concurrent admins |
-| Fleet | Up to ~100 nodes per master in v1 |
-| Addons | 10–30 installed per host, ~10 running |
-| Latency | API p95 < 100 ms; terminal echo < 50 ms on LAN; node command relay adds < 50 ms on LAN |
-| Footprint | Node agent idle < 50 MB; standalone gateway idle < 100 MB (excluding PostgreSQL) |
-| Security | A compromised gateway or addon must not yield root on the host |
-| Platform | Linux with systemd (assumed 250+, verified at install) and D-Bus |
-
-### 2.3 Constraints
-
-- Go for backend and UI rendering.
-- PostgreSQL is required in **standalone** and **master** modes; **node** mode is database-less.
-- All external traffic is TLS. polkit is the authorization authority for privileged actions.
-- GPL v2 licensed; distributed as a tarball.
+1. Overview & goals
+2. Non-goals / explicit scope boundaries
+3. Architecture
+4. Repository layout
+5. Data model (PostgreSQL schema)
+6. Auth & identity
+7. RBAC (roles, permissions, resource grants)
+8. API design principles
+9. API reference (endpoint catalog)
+10. Locations & Nodes
+11. Node bootstrap handshake
+12. Panel ↔ Node control channel protocol
+13. Backends: Docker & VM
+14. Image templates (`.tmz`)
+15. Install process
+16. Server lifecycle
+17. Port allocation
+18. `tmz` — the in-guest agent
+19. Console
+20. File management
+21. Backups
+22. Databases (user-facing hosting)
+23. Scheduler (`.tmz.sc`)
+24. Assets / CDN
+25. Addons (deferred)
+26. Threat model summary
+27. Open questions
+28. Glossary
 
 ---
 
-## 3. Deployment Modes and Architecture
+## 1. Overview & goals
 
-| Mode | Serves UI | Talks to | Database | Manages |
-|---|---|---|---|---|
-| **Standalone** | Yes | Local systemd/D-Bus | PostgreSQL | The host it runs on |
-| **Master** | Yes | Nodes (over mTLS) | PostgreSQL | Nodes, through them; not its own host unless a node agent also runs there |
-| **Node** | **No** | Master (outbound mTLS) | None | The host it runs on, on master's instruction |
+A self-hosted control plane ("the panel") for managing a fleet of machines ("Nodes"), each running an agent ("the daemon"), capable of provisioning and running **Docker containers** and **QEMU/virtio VMs** from reusable, versioned **image templates**. Users are scoped to their own servers by default; Admins and a single Owner manage the fleet, users, and infrastructure.
 
-Because the master does no host work itself, run a node agent on the master's machine if that host should also be managed.
+Design priorities, in order:
+1. **Safety of the trust boundaries** — a compromised guest (container or VM) must never be able to escalate into host or panel control. Every design decision involving the in-guest agent (`tmz`) is filtered through this.
+2. **Operational simplicity** — prefer one well-understood mechanism over several half-built ones (e.g. Postgres-only rather than pluggable DBs; ordinary Go packages rather than git submodules for internal code).
+3. **Backend parity** — Docker and VM servers should look identical from the panel's and the user's point of view wherever practical (console, file access, scheduling, power actions), even though the underlying mechanisms differ substantially.
+4. **Human-editable configuration** — templates and schedules should be inspectable and hand-editable, not opaque blobs.
+
+## 2. Non-goals / explicit scope boundaries
+
+These were considered and deliberately cut from v1, recorded here so they aren't silently reconsidered mid-implementation:
+
+- **Kubernetes support** — cut. A per-node daemon model doesn't map cleanly onto a cluster's own control plane; revisit only as a distinct, later integration (panel talking to an existing cluster's API, not the daemon reimplementing kubelet).
+- **Bare-metal provisioning via hardware KVM/IPMI** — cut. Its own subsystem (PXE/imaging), unrelated in shape to Docker/VM provisioning.
+- **Pluggable database backends** — cut. PostgreSQL only, hardcoded.
+- **Automatic node placement / bin-packing** — cut for v1. Placement is manual (admin picks the node).
+- **Runtime-loadable (dynamic) backend plugins** — cut. Docker and VM backends are compiled-in Go packages, not Go `plugin`-loaded or third-party-extensible yet.
+- **API versioning (`/v1/`, `/v2/`)** — deliberately omitted. Accepted trade-off: the API must evolve additively (new fields/endpoints only) rather than via breaking version bumps.
+
+## 3. Architecture
+
+### 3.1 System overview
 
 ```mermaid
 flowchart LR
-  B[Browser] -->|HTTPS/WSS| M[Master: UI + relay + PostgreSQL]
-  M <-->|mTLS, node dials out| N1[Node 1]
-  M <-->|mTLS, node dials out| N2[Node 2]
+    subgraph P["Panel"]
+        P1["Go backend, single binary"]
+        P2["Astro frontend: static/CSR, served by Go, same-origin"]
+        P3[("PostgreSQL, hardcoded")]
+        P4[("Redis: cache, sessions, rate-limit")]
+    end
 
-  subgraph Node host
-    N1 --> HP[Privileged helper]
-    HP --> W[Per-session worker as user]
-    N1 <--> AD[Addon processes]
-    W --> SYS[(systemd / D-Bus / polkit)]
-  end
+    subgraph N["Node"]
+        N1["Daemon, pure Go binary"]
+        N2["Docker backend"]
+        N3["VM/virtio backend"]
+        N4["tmz agent, runs inside guests"]
+    end
+
+    P1 <== "persistent WSS control channel" ==> N1
+    N1 --> N2
+    N1 --> N3
+    N2 --> N4
+    N3 --> N4
 ```
 
-Standalone is the same picture with the master and the node collapsed into one host and no mTLS hop.
+### 3.2 Detailed data-flow view
 
-### 3.1 Components
+```mermaid
+flowchart TB
+    subgraph Browser["User's browser"]
+        UI["Astro static/CSR UI"]
+    end
 
-**Gateway (Go, unprivileged).** Network-facing process. In standalone/master mode: terminates TLS, renders the UI (SSR), exposes REST and WebSocket APIs, owns sessions, issues addon tokens, enforces capabilities, writes audit records. In node mode: no listening UI or API; only the outbound master link.
+    subgraph Panel["Panel — Go backend"]
+        API["/api/* — REST + WS<br/>session / CSRF / permission middleware"]
+        RBAC["RBAC engine: role + resource grants"]
+        TPL["Template parser: .tmz / .tmz.sc"]
+        SCHED["Scheduler trigger engine"]
+        PG[("PostgreSQL")]
+        REDIS[("Redis")]
+    end
 
-**Node agent (Go, unprivileged).** The node-mode replacement for the gateway. Maintains the outbound mTLS connection, verifies master-signed identity assertions, dispatches work to workers and addons, keeps a local audit journal.
+    subgraph Node["Node — Daemon"]
+        CTRL["Control channel handler"]
+        DOCKER["Docker backend"]
+        VM["VM/virtio backend"]
+        FS["Volume directory: bind-mount or virtiofs"]
+    end
 
-**Privileged helper (Go, tiny, root).** Reachable only over a local unix socket from the gateway/agent uid. Does PAM authentication (standalone/master) and spawns per-session workers as the target Unix user. Its surface is deliberately small.
+    subgraph Guest["Container or VM"]
+        TMZ["tmz agent"]
+        APP["Running server process"]
+    end
 
-**Per-session worker (Go, runs as the acting user).** Does the actual system work *as that user*: D-Bus calls, `journalctl`, PTY, files. The kernel and polkit decide what it may do.
+    S3[("S3 bucket: backups")]
 
-**Addon runtime.** Each addon backend is its own sandboxed process (section 7.4).
-
-**UI renderer.** Go renders HTML for the shell, built-in modules, and addons in UI-API mode using trusted components. Small client-side islands (web components) provide interactivity: terminal, charts, log viewer.
-
-### 3.2 Why this shape
-
-- The exposed component (gateway) has no privileges; the privileged component (helper) is not network-reachable.
-- Real work runs with the user's rights, so an app-level permission bug does not become root.
-- The node agent has no UI and no inbound ports, which shrinks the attack surface of every managed host to the minimum.
-- Nodes dial out, so they work behind NAT and strict firewalls.
-
----
-
-## 4. Identity, Sessions, and polkit
-
-### 4.1 Authentication
-
-- **Standalone/master:** PAM through the helper. Because PAM goes through the host's stack, SSSD-backed LDAP/AD accounts work without extra code. OIDC is a later option.
-- **Node:** does not authenticate humans. It trusts short-lived **identity assertions** signed by the master (4.4).
-
-### 4.2 polkit as the authorization authority
-
-Two kinds of decisions go through polkit:
-
-1. **System actions** (start a unit, set hostname, manage storage). The worker runs as the user and calls D-Bus, so systemd, NetworkManager and the rest already ask polkit.
-2. **Panel actions**, declared in the panel's own `.policy` file, for example:
-
-| polkit action | Guards |
-|---|---|
-| `org.serverpanel.addon.install` | Installing/removing addons |
-| `org.serverpanel.addon.grant` | Approving addon capabilities |
-| `org.serverpanel.addon.direct-access` | Enabling direct access (**the "high-ranking user" check**) |
-| `org.serverpanel.node.enroll` | Enrolling or revoking nodes |
-| `org.serverpanel.audit.read` | Reading the audit log |
-| `org.serverpanel.settings.write` | Changing panel configuration |
-
-The helper calls polkit's `CheckAuthorization` with the worker process as the subject. Site admins tune who holds each action with standard polkit `.rules` files, so "who is high-ranking" is ordinary polkit policy rather than a parallel role system.
-
-**Interactive authentication:** when polkit answers "authentication required" (for example `auth_admin`), the worker registers a polkit authentication agent and the UI prompts for the password inline, as Cockpit does.
-
-### 4.3 Sessions and idle revocation
-
-- Session cookie: `HttpOnly; Secure; SameSite=Strict`, stored server-side in PostgreSQL.
-- **Web session idle timeout: 1 hour.** Idle is measured from the last *user-initiated* request. Passive traffic (live log streams, metrics polling) is marked passive by the client and does not refresh the timer, so an unattended page cannot keep a session alive forever. (The marking is client-declared, but it only affects that user's own session.)
-- On expiry: the session is revoked, all non-terminal channels close, and every addon token and addon-site session derived from it dies with it.
-
-**Terminal sessions are exempt.** Implementation:
-
-- A terminal channel holds a **terminal lease** (session id, PTY id, worker, last I/O time). The PTY and its WebSocket survive the web session's expiry.
-- After expiry, that session can no longer do anything else, and cannot *open new* terminals. Re-authentication reattaches the user to their existing leased PTYs.
-- Recommended safeguard (open question 4): configurable `terminal.idle_timeout` and `terminal.max_lifetime`, defaulting to none per the requirement, because an abandoned terminal, especially one holding a fresh `sudo` timestamp, is a standing open door.
-
-### 4.4 Identity across master and nodes
-
-The node's kernel and polkit need a *local* Unix identity to enforce rights, but the user authenticated at the master. Design:
-
-1. Master authenticates the user (PAM/SSSD on master).
-2. For each request to a node, master signs a short-lived **identity assertion**: user, session id, target node id, nonce, expiry (about 60 seconds).
-3. Node verifies the signature against the pinned master key, then maps the master identity to a **local Unix user** using an admin-managed mapping (default: same username; root mapping must be explicitly allowed).
-4. The node's helper spawns the worker as that user; polkit on the node makes the local decision.
-
-Consequence to accept: a compromised master can assert any *mapped* identity on any node. Mitigations: non-root mappings by default, node-side polkit still applies, both sides write audit records, assertions are short-lived and audience-bound.
-
-### 4.5 Node enrollment and transport
-
-- An admin (polkit-authorized) creates a **one-time enrollment token** on the master.
-- The node presents the token and a CSR; master acts as a small internal CA and returns a client certificate, and the node pins the master's identity.
-- Certificates are short-lived (for example 30 days) and auto-renewed; revocation removes the node's trust immediately.
-- The node holds **one outbound mTLS WebSocket** to the master. It carries the same multiplexed channel protocol as browser-to-gateway (section 8), so there is one protocol to build and test.
-- If the node is offline, master shows it offline. Mutating commands are **not** queued beyond a short TTL (for example 60 seconds), to avoid surprise replays.
-
----
-
-## 5. TLS
-
-- TLS 1.2+ (1.3 preferred) for all listeners; HSTS on the panel origin.
-- Certificate sources: provided cert/key, built-in ACME (HTTP-01 or DNS-01), or a self-signed bootstrap certificate whose fingerprint is displayed at first run.
-- Master-to-node links use mTLS with the internal CA, independent of the public certificate.
-- Wildcard DNS and certificate are needed only for the subdomain style of addon site and iframe isolation (7.3); a port-based fallback exists.
-
----
-
-## 6. Trust Model and Permissions
-
-### 6.1 Actors
-
-| Actor | Trust | Identity |
-|---|---|---|
-| Logged-in user | Up to their Unix rights and polkit grants | Session cookie |
-| High-ranking user | Holds specific polkit panel actions | Same, plus polkit |
-| Addon UI code (custom mode) | Untrusted | Scoped addon token |
-| Addon backend | Untrusted | Its uid, verified by `SO_PEERCRED` |
-| Gateway / node agent | Semi-trusted (unprivileged) | n/a |
-| Master (from a node's view) | Trusted to assert mapped identities | Pinned key + mTLS |
-| Helper | Trusted, minimal | n/a |
-
-### 6.2 The two-gate rule (standard mode)
-
-```
-allowed = (the user could do it as their own Unix identity, per kernel/polkit)
-          AND (the addon holds the matching capability)
+    UI -- "HTTPS, same-origin" --> API
+    API --> RBAC
+    API --> TPL
+    API --> SCHED
+    API <--> PG
+    API <--> REDIS
+    API == "persistent WSS control channel" ==> CTRL
+    UI -. "console ticket, then WS data channel" .-> CTRL
+    CTRL --> DOCKER
+    CTRL --> VM
+    DOCKER --> FS
+    VM --> FS
+    FS <-. "port 38411, isolated per-server network" .-> TMZ
+    TMZ --> APP
+    Node -- "backup upload" --> S3
 ```
 
-Gate 1 is enforced by the OS because the worker acts as the user. Gate 2 is enforced by the gateway or node agent on every call. An addon can only *narrow* what a user can do through it.
+### 3.3 Trust boundaries
 
-### 6.3 Capabilities
+```mermaid
+flowchart LR
+    subgraph Trusted["Fully trusted"]
+        Panel
+        Node
+    end
+    subgraph Semi["Semi-trusted: operator controlled, not exposed to guest tenants"]
+        DBHost["Database hosts"]
+        S3B["S3 backup bucket"]
+    end
+    subgraph Untrusted["Untrusted: assume compromise is possible"]
+        Guest2["Container / VM"]
+        TMZAgent["tmz agent"]
+    end
 
-Declared in the manifest, approved by someone holding `addon.grant`, re-approved on any change.
-
-| Capability | Meaning |
-|---|---|
-| `systemd.units:read` | List units and status |
-| `systemd.units:control` | Start/stop/restart (optionally scoped by glob) |
-| `journal:read` | Read logs (optionally per unit) |
-| `files:read:<path>` / `files:write:<path>` | Path-scoped file access |
-| `net:outbound` | Outbound network from the addon process |
-| `storage:own:<quota>` | Private persistent storage |
-| `addon.call:<id>` | Call a declared dependency (see 7.5) |
-| `ui:nav`, `ui:notify` | Navigation entries, notifications |
-
-### 6.4 Direct access mode
-
-An addon that needs more than the capability API declares a `direct_access` entry per scope in its manifest (for example `direct:shell`, `direct:dbus`, `direct:fs`).
-
-Required by the design:
-
-1. The addon **must declare** it in the manifest.
-2. Only a user holding `org.serverpanel.addon.direct-access` (high-ranking) can enable it.
-3. **Every enable** shows a warning dialog with a legal notice that must be accepted.
-
-Recommended additions (open question 9):
-
-- Time-box the grant (for example 8 hours) and show a persistent banner while active.
-- Keep granular scopes instead of a single switch.
-- **Protected resources stay off-limits even in direct mode:** panel config, addon store, PostgreSQL credentials, the audit log, helper socket, and the master's CA key.
-- Direct access still runs as the acting user's uid, never implicit root.
-- Direct-mode actions carry a distinct audit flag.
-
-> A legal notice addresses consent and liability, not host safety. Get legal review of the wording (I'm not a lawyer). The technical limits above are what protect the host.
-
----
-
-## 7. Addon System
-
-### 7.1 Package layout
-
-```
-my-addon/
-├── manifest.json
-├── ui/                # compiled HTML/CSS/JS (custom mode) or page definitions (UI API mode)
-├── bin/               # backend executable(s), any language
-└── signature
+    Panel <-- "mTLS or signed node token" --> Node
+    Node -- "narrow, allow-listed requests only" --> TMZAgent
+    TMZAgent -. "NEVER: arbitrary code, shell, or file access outside its allow-list" .-> Node
+    Node --> DBHost
+    Node --> S3B
 ```
 
-TypeScript is compiled before packaging (browsers cannot run `.ts`); a `panel-addon build` command wraps esbuild so authors can write TS and CSS and get a correct package.
+The single governing rule for every guest-facing protocol decision in this document: **the guest can be fully compromised and the blast radius must stop at the guest's own resources.** `tmz`'s allow-list, the per-server isolated network, and identity-by-channel (not by self-reported field) all exist to enforce this one rule.
 
-### 7.2 Manifest (draft)
+## 4. Repository layout
 
-```json
-{
-  "id": "com.example.backup-manager",
-  "name": "Backup Manager",
-  "version": "1.2.0",
-  "publisher": "example.com",
-  "api_version": "1",
+Single monorepo for the panel; the Astro frontend is the one git submodule (own release cadence). Internal Go logic is ordinary packages — not submodules, not runtime plugins.
 
-  "presentation": "embedded",
-  "site": null,
+```
+/panel
+  /cmd
+    /panel            -- main entrypoint
+  /internal
+    /auth             -- sessions, oauth, webauthn, totp
+    /rbac             -- roles, permissions, resource grants
+    /api              -- HTTP handlers, middleware chain
+    /templates         -- .tmz / .tmz.sc parsing
+    /scheduler         -- graph model, trigger engine (panel-side half)
+    /nodes             -- node registry, bootstrap handshake, control channel
+    /backends
+      /docker          -- docker-specific provisioning request builders
+      /vm               -- vm-specific provisioning request builders
+    /db                -- postgres access layer (sqlc or similar generated code)
+    /cache             -- redis client wrappers
+    /audit             -- audit log writer
+  /migrations          -- postgres schema migrations
+  /web -> (git submodule) astro frontend, built to /internal/api/static
 
-  "ui": {
-    "api": true,
-    "pages": [
-      { "path": "/", "title": "Backups", "view": "views/overview" }
-    ],
-    "custom": null
-  },
+/daemon
+  /cmd
+    /daemon            -- main entrypoint, runs on each node
+  /internal
+    /control           -- control channel client, message dispatch
+    /docker             -- docker backend implementation
+    /vm                  -- qemu/virtio backend implementation
+    /install             -- install-container orchestration
+    /fs                  -- bind-mount / virtiofs volume management
+    /net                 -- per-server isolated network setup
+    /sftp                -- unified sftp server over local volume dirs
 
-  "backend": { "exec": "bin/backup-manager", "restart": "on-failure" },
-  "placement": { "backend_runs_on": "node", "ui_served_by": "master" },
-
-  "capabilities": [
-    { "cap": "systemd.units:read" },
-    { "cap": "files:read", "path": "/srv/data" },
-    { "cap": "storage:own", "quota": "500MB" }
-  ],
-  "dependencies": [
-    { "id": "com.example.storage-tools", "version": "^1.0", "optional": false }
-  ],
-  "exports": [
-    { "name": "backup.run", "requires": ["systemd.units:control"] }
-  ],
-  "direct_access": [],
-  "limits": { "cpu_weight": 50, "memory_high": "128M", "memory_max": "256M", "tasks_max": 64 }
-}
+/tmz
+  /cmd
+    /tmz               -- in-guest agent entrypoint
+  /internal
+    /power              -- start/stop/restart/kill handling
+    /sched               -- guest-side scheduler execution engine
+    /customize           -- ps1/shebang/autocomplete push handling
+    /update              -- self-update-when-stopped logic (mostly daemon-driven)
 ```
 
-### 7.3 Presentation modes (`presentation`)
+## 5. Data model (PostgreSQL schema)
 
-| Mode | What it is | Serving and isolation |
-|---|---|---|
-| `embedded` | A custom tool inside the panel, appearing in the panel's navigation | UI API pages are rendered by the panel itself. Custom-mode pages load in an isolated iframe |
-| `site` | A separate site alongside the panel, on its own hostname or port | Panel's TLS listener routes by host/port; its own origin by construction |
+This is the panel's own metadata store. Illustrative `CREATE TABLE` shapes — types and constraints to be refined at implementation time.
 
-For `site`, a **one-time-code SSO handshake** gives the addon site a host-only session cookie. That cookie is not valid against the panel API, and it dies when the parent web session expires.
+### 5.1 Identity & auth
 
-### 7.4 UI modes (`ui.api`)
+```sql
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email           CITEXT UNIQUE NOT NULL,
+    username        CITEXT UNIQUE NOT NULL,
+    password_hash   TEXT,                    -- NULL until invite is completed
+    role_id         UUID NOT NULL REFERENCES roles(id),
+    is_owner        BOOLEAN NOT NULL DEFAULT FALSE,  -- exactly one row may be TRUE, enforced below
+    banned_at       TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by      UUID REFERENCES users(id)  -- NULL for the bootstrap owner
+);
 
-The two modes are **mutually exclusive per addon**. This is my reading of the requirement; see open question 3.
+-- enforce "at most one owner" at the database level, not just app logic
+CREATE UNIQUE INDEX one_owner_only ON users ((is_owner)) WHERE is_owner = TRUE;
 
-**`ui.api: true` (UI API mode).** The addon describes its UI through the panel's high-level UI API, using the panel's component set (tables, forms, charts, log viewer, terminal, dialogs). Its backend returns a UI description; the panel renders it server-side with trusted components and routes UI events back to the addon backend. **No addon JavaScript runs in the browser**, which makes this the safest mode and consistent in look and feel. No origin isolation is needed.
+CREATE TABLE invites (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    token_hash      TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    consumed_at     TIMESTAMPTZ,
+    created_by      UUID NOT NULL REFERENCES users(id)
+);
 
-**`ui.api: false` (custom mode).** The UI API is disabled. The addon ships its own components and defines its own **routes** in the manifest (path to component/entry), built with HTML, CSS, and TS. This is arbitrary browser code, so it must be isolated:
+CREATE TABLE password_resets (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    token_hash      TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    consumed_at     TIMESTAMPTZ
+);
 
-- Serve from an isolated origin (`<addon>.addons.<host>` or its own port), or from a sandboxed iframe using `Content-Security-Policy: sandbox allow-scripts` (opaque origin) with a `postMessage` bridge.
-- Authenticate with a short-lived scoped token (`addon_id`, `user_id`, `session_id`, `exp`; about 5 minutes; refreshed by the shell).
-- Per-addon CSP: `default-src 'self'`; `connect-src` limited to the addon's own API prefix.
-- A provided JS/TS SDK handles tokens, calls, and streaming.
-- Optionally use the panel's web-component library and theme tokens so custom addons still look native.
+CREATE TABLE oauth_identities (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    provider        TEXT NOT NULL,           -- 'google' | 'github' | 'discord' | 'oidc:<config_id>'
+    provider_uid    TEXT NOT NULL,
+    linked_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (provider, provider_uid)
+);
 
-### 7.5 Process sandbox
+CREATE TABLE oidc_providers (               -- admin-configured custom OIDC providers
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    issuer_url      TEXT NOT NULL,
+    client_id       TEXT NOT NULL,
+    client_secret_enc TEXT NOT NULL,        -- encrypted at rest
+    scopes          TEXT[] NOT NULL DEFAULT '{openid,email,profile}',
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE
+);
 
-Each addon backend is started as a **systemd transient unit** on the host where it runs (a node, or standalone host).
+CREATE TABLE webauthn_credentials (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    credential_id   BYTEA NOT NULL UNIQUE,
+    public_key      BYTEA NOT NULL,
+    sign_count      BIGINT NOT NULL DEFAULT 0,
+    label           TEXT,                    -- "iPhone", "YubiKey", user-assigned
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-| Concern | Mechanism |
-|---|---|
-| Identity | `DynamicUser=yes` (unique uid, enables `SO_PEERCRED` identification) |
-| Filesystem | `ProtectSystem=strict`, `ProtectHome=yes`, `PrivateTmp=yes`, `StateDirectory=` |
-| Privileges | `NoNewPrivileges=yes`, empty capability bounding set |
-| Syscalls | `SystemCallFilter=@system-service` (tighten as possible) |
-| Network | `PrivateNetwork=yes` by default; `net:outbound` opens it |
-| Only exit | A unix socket to the local gateway/agent |
+CREATE TABLE totp_secrets (
+    user_id         UUID PRIMARY KEY REFERENCES users(id),
+    secret_enc      TEXT NOT NULL,           -- encrypted at rest
+    enabled_at      TIMESTAMPTZ
+);
 
-**Burstable resources (cgroup v2):** `CPUWeight` (fair share, bursts when idle), `MemoryHigh` (soft throttle), `MemoryMax` (hard OOM-kill inside the cgroup), `TasksMax` (fork-bomb guard), `IOWeight`.
+CREATE TABLE totp_backup_codes (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    code_hash       TEXT NOT NULL,
+    used_at         TIMESTAMPTZ
+);
+```
 
-Limitation: per-destination network allowlists are not provided by plain systemd. v1 offers `net:outbound` on/off; a later version can route addon traffic through a proxy with an allowlist.
+### 5.2 RBAC
 
-### 7.6 Addon-to-addon interaction
+```sql
+CREATE TABLE roles (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT UNIQUE NOT NULL,     -- 'owner' | 'admin' | 'user' | custom
+    is_builtin      BOOLEAN NOT NULL DEFAULT FALSE,
+    version         BIGINT NOT NULL DEFAULT 1 -- bumped on every permission change, used for session cache invalidation
+);
 
-Addons may interact **only** if the caller lists the callee in `dependencies`.
+CREATE TABLE permissions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    key             TEXT UNIQUE NOT NULL      -- e.g. 'server.create', 'node.manage', 'user.ban'
+);
 
-- The callee lists what it offers in `exports`. Calls to anything not exported are rejected.
-- All calls go **through the gateway/agent**, never socket-to-socket, so they are checked, attenuated, and audited. Across nodes they are routed via the master.
-- At install, the approver sees "A depends on B and may call B's exports X, Y" and approves the link. Dependencies are resolved by version range; install order follows the graph; removing an addon that others depend on is blocked; cycles are rejected.
-- **Attenuation rule (recommended default):** during a call chain, the callee runs with the *intersection* of the caller's and callee's capabilities. This prevents **capability laundering**, where a weak addon borrows a strong addon's permissions. Full callee rights can be granted per link by an explicit approval.
-- Each audit record for a chained call includes the whole call chain.
+CREATE TABLE role_permissions (
+    role_id         UUID NOT NULL REFERENCES roles(id),
+    permission_id   UUID NOT NULL REFERENCES permissions(id),
+    PRIMARY KEY (role_id, permission_id)
+);
 
-### 7.7 Supply chain
+CREATE TABLE server_grants (                 -- resource-level, independent of role
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    user_id         UUID NOT NULL REFERENCES users(id),
+    granted_by      UUID NOT NULL REFERENCES users(id),
+    permissions     TEXT[] NOT NULL,          -- e.g. '{console.access}'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (server_id, user_id)
+);
 
-- Packages are signed by the publisher and verified against trusted keys.
-- Capability or dependency changes on update require re-approval.
-- Local unsigned install is allowed for authorized users and flagged.
-- Later: a registry with publisher verification and revocation.
+CREATE TABLE resource_limits (               -- per-user caps, editable by owner/admin
+    user_id         UUID PRIMARY KEY REFERENCES users(id),
+    cpu_cores       NUMERIC,
+    ram_mb          BIGINT,
+    gpu_count       INT,
+    storage_mb      BIGINT,
+    bandwidth_mbps  INT,
+    vm_creation_allowed BOOLEAN NOT NULL DEFAULT FALSE  -- default off for everyone except owner
+);
+```
 
----
+### 5.3 Infrastructure
 
-## 8. API Design
+```sql
+CREATE TABLE locations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    short_name      CITEXT UNIQUE NOT NULL,   -- e.g. 'ins' for a datacenter short code
+    name            TEXT NOT NULL,
+    country         TEXT NOT NULL
+);
 
-### 8.1 Style
+CREATE TABLE nodes (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    location_id         UUID NOT NULL REFERENCES locations(id),
+    name                TEXT NOT NULL,
+    short_name          CITEXT UNIQUE NOT NULL,  -- used for port allocation namespacing
+    fqdn_or_ip          TEXT NOT NULL,
+    ssl_enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    sftp_port           INT NOT NULL,
+    panel_port          INT NOT NULL,
+    behind_proxy        BOOLEAN NOT NULL DEFAULT FALSE,
+    docker_enabled      BOOLEAN NOT NULL DEFAULT TRUE,
+    vm_enabled          BOOLEAN NOT NULL DEFAULT FALSE,
+    cpu_cores_cap       NUMERIC NOT NULL,
+    ram_mb_cap          BIGINT NOT NULL,
+    gpu_count_cap       INT NOT NULL DEFAULT 0,
+    storage_mb_cap      BIGINT NOT NULL,
+    port_range_start    INT NOT NULL,
+    port_range_end      INT NOT NULL,
+    credential_fingerprint TEXT,              -- identifies the issued mTLS cert / signed token
+    status              TEXT NOT NULL DEFAULT 'pending',  -- pending | online | offline | draining
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-- **REST + JSON**, documented in **OpenAPI**, with generated SDKs (TypeScript for addon UIs, Go and others for addon backends).
-- **WebSocket** with a multiplexed **channel** protocol (open/data/close/error, flow control): `logs`, `terminal`, `metrics`, `file-watch`. The same protocol runs browser-to-gateway and node-to-master.
-- Errors use **RFC 9457** `problem+json` with stable codes. Versioned under `/api/v1`. Mutating calls accept `Idempotency-Key`.
-- In master mode, every resource endpoint accepts a node selector (`/api/v1/nodes/{node}/...`); the master relays to the node.
+CREATE TABLE node_bootstrap_tokens (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id         UUID NOT NULL REFERENCES nodes(id),
+    token_hash      TEXT NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL,
+    consumed_at     TIMESTAMPTZ
+);
 
-### 8.2 Core endpoints (illustrative)
+CREATE TABLE node_resource_usage (           -- rolling snapshot, updated from control-channel heartbeats
+    node_id         UUID PRIMARY KEY REFERENCES nodes(id),
+    cpu_allocated   NUMERIC NOT NULL DEFAULT 0,
+    ram_allocated_mb BIGINT NOT NULL DEFAULT 0,
+    gpu_allocated   INT NOT NULL DEFAULT 0,
+    storage_allocated_mb BIGINT NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-| Method | Path | Purpose |
-|---|---|---|
-| POST | `/api/v1/auth/login`, `/logout` | PAM login / logout |
-| GET | `/api/v1/me` | Current user and polkit-derived abilities |
-| GET | `/api/v1/[nodes/{n}/]systemd/units` | List units |
-| POST | `/api/v1/[nodes/{n}/]systemd/units/{name}/{action}` | Unit control |
-| GET | `/api/v1/[nodes/{n}/]ws` | Channel socket |
-| GET/PUT | `/api/v1/[nodes/{n}/]files…`, `/uploads/{id}` | Files, resumable upload |
-| GET/POST | `/api/v1/addons`, `/addons/{id}/grants`, `/addons/{id}/direct-access` | Addon lifecycle and approvals |
-| POST | `/api/v1/nodes/enroll-tokens`, GET `/api/v1/nodes` | Node enrollment and status |
-| GET | `/api/v1/audit` | Query audit log |
-| ANY | `/addon-api/{id}/*` | Token-authenticated route to an addon backend |
+CREATE TABLE port_allocations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id         UUID NOT NULL REFERENCES nodes(id),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    port            INT NOT NULL,
+    protocol        TEXT NOT NULL DEFAULT 'tcp',
+    is_static       BOOLEAN NOT NULL DEFAULT FALSE,
+    UNIQUE (node_id, port, protocol)
+);
+```
 
-Uploads and downloads are streamed by the worker as the acting user (file permissions apply naturally), chunked and resumable, written to a temp file then atomically renamed.
+### 5.4 Templates & servers
 
----
+```sql
+CREATE TABLE image_templates (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    backend         TEXT NOT NULL,            -- 'docker' | 'vm'
+    version         INT NOT NULL DEFAULT 1,
+    body_json       JSONB NOT NULL,           -- the parsed .tmz content
+    created_by      UUID NOT NULL REFERENCES users(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-## 9. Data Model (PostgreSQL)
+CREATE TABLE servers (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id        UUID NOT NULL REFERENCES users(id),
+    node_id         UUID NOT NULL REFERENCES nodes(id),
+    template_id     UUID NOT NULL REFERENCES image_templates(id),
+    name            TEXT NOT NULL,
+    description     TEXT,
+    backend         TEXT NOT NULL,            -- 'docker' | 'vm'
+    cpu_cores       NUMERIC NOT NULL,
+    ram_mb          BIGINT NOT NULL,
+    gpu_count       INT NOT NULL DEFAULT 0,
+    storage_mb      BIGINT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'installing',
+    -- installing | install_failed | running | stopped | suspended | deleting
+    install_attempts INT NOT NULL DEFAULT 0,   -- capped at 3
+    volume_path     TEXT,                      -- resolved node-local directory
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-Used by **standalone** and **master**. Nodes store no application state: config and certificates live under `/etc`, and their local audit journal is a file.
+CREATE TABLE server_variables (               -- resolved template variable values for this server
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    key             TEXT NOT NULL,
+    value           TEXT NOT NULL,
+    PRIMARY KEY (server_id, key)
+);
 
-| Table | Key fields |
-|---|---|
-| `sessions` | id, unix_user, created_at, last_user_activity, expires_at, revoked_at, ip, user_agent |
-| `terminal_leases` | id, session_id, node_id, pty_id, opened_at, last_io_at, closed_at |
-| `nodes` | id, name, cert_fingerprint, enrolled_by, enrolled_at, last_seen, state, agent_version |
-| `enroll_tokens` | id, token_hash, created_by, expires_at, used_at |
-| `addons` | id, version, publisher, manifest_json, signature_status, state, installed_by |
-| `addon_installs` | addon_id, node_id, state, installed_at (where the backend runs) |
-| `addon_grants` | addon_id, capability, params_json, granted_by, granted_at, manifest_version |
-| `addon_dependencies` | addon_id, depends_on_id, version_range, approved_by, attenuation_mode |
-| `direct_access_grants` | addon_id, node_id, scope, granted_by, granted_at, expires_at, legal_ack_version, legal_ack_at |
-| `audit_events` | see section 11 |
-| `settings` | key, value |
+CREATE TABLE install_logs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    attempt         INT NOT NULL,
+    log_text        TEXT NOT NULL,
+    succeeded       BOOLEAN,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at     TIMESTAMPTZ
+);
+```
 
-**Database hardening:**
+### 5.5 Backups & databases
 
-- Separate roles: a migration/admin role and a runtime application role. The runtime role has **INSERT-only** on `audit_events` (no UPDATE/DELETE).
-- Migrations are versioned and applied at upgrade.
-- Backups by `pg_dump` or WAL archiving; the panel documents a recommended schedule.
-- PostgreSQL is an **external dependency** the tarball installer checks for; it does not bundle a database (open question 7).
+```sql
+CREATE TABLE backups (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    destination_type TEXT NOT NULL,           -- 'location' | 'node'
+    destination_id  UUID NOT NULL,            -- location_id or node_id depending on destination_type
+    s3_bucket       TEXT NOT NULL,
+    s3_key          TEXT NOT NULL,
+    size_bytes      BIGINT,
+    status          TEXT NOT NULL DEFAULT 'pending',  -- pending | uploading | complete | failed
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
----
+CREATE TABLE database_hosts (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    engine          TEXT NOT NULL,            -- 'mysql' | 'postgres' | ...
+    host             TEXT NOT NULL,
+    port             INT NOT NULL,
+    admin_user_enc   TEXT NOT NULL,           -- encrypted
+    admin_pass_enc   TEXT NOT NULL,           -- encrypted
+    max_databases    INT
+);
 
-## 10. Key Flows
+CREATE TABLE server_databases (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    host_id         UUID NOT NULL REFERENCES database_hosts(id),
+    db_name         TEXT NOT NULL,
+    db_user         TEXT NOT NULL,
+    db_pass_enc     TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
 
-### 10.1 Login (standalone/master)
+### 5.6 Scheduler & audit
 
-1. Browser posts credentials over TLS to the gateway.
-2. Gateway asks the helper to run PAM; helper returns uid and groups, never the password.
-3. Gateway creates the session row and sets the cookie.
-4. The first privileged request makes the helper spawn a worker as that user.
+```sql
+CREATE TABLE schedules (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    server_id       UUID NOT NULL REFERENCES servers(id),
+    name            TEXT NOT NULL,
+    body_json       JSONB NOT NULL,           -- the .tmz.sc graph
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    version         INT NOT NULL DEFAULT 1,   -- bumped on edit, used for guest push/confirm
+    pushed_at       TIMESTAMPTZ,
+    ack_at          TIMESTAMPTZ,              -- guest confirmed receipt of this version
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 
-### 10.2 Action on a node via master
+CREATE TABLE schedule_runs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    schedule_id     UUID NOT NULL REFERENCES schedules(id),
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at     TIMESTAMPTZ,
+    status          TEXT,                     -- 'success' | 'failed' | 'running'
+    log_text        TEXT
+);
+
+CREATE TABLE audit_log (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    actor_id        UUID REFERENCES users(id),
+    action          TEXT NOT NULL,            -- e.g. 'server.stop', 'user.ban', 'node.create'
+    target_type     TEXT,
+    target_id       UUID,
+    metadata        JSONB,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+## 6. Auth & identity
+
+### 6.1 First-run setup
+
+
 
 ```mermaid
 sequenceDiagram
-  participant U as Browser
-  participant M as Master
-  participant N as Node agent
-  participant W as Worker (as mapped user)
-  U->>M: POST /nodes/web1/systemd/units/nginx/restart
-  M->>M: validate session, idle timer, write audit (received)
-  M->>N: command + signed identity assertion (mTLS channel)
-  N->>N: verify assertion, map to local user, node-side audit
-  N->>W: spawn/reuse worker as user
-  W->>W: D-Bus StartUnit (systemd asks polkit)
-  W-->>N: result
-  N-->>M: result + node audit id
-  M->>M: write audit (completed)
-  M-->>U: response
+    participant Console as Host machine console
+    participant Panel
+    participant Person
+
+    Panel->>Panel: Check any user with is_owner = TRUE
+    alt no owner exists
+        Panel->>Console: Print large unique setup token
+        Panel->>Panel: Accept requests ONLY on /api/auth/setup
+        Person->>Panel: POST /api/auth/setup (email, username, password, token)
+        Panel->>Panel: Validate token, create user with is_owner=TRUE
+        Panel->>Console: Erase token, regenerate a new one if needed
+        Panel->>Panel: Unlock all other endpoints and disable public registration
+        Panel-->>Person: Redirect to /login
+    else owner already exists
+        Panel-->>Person: Normal login flow
+    end
 ```
 
-### 10.3 Addon action with a dependency
 
-1. Addon A's backend needs `backup.run` from B and calls the local gateway/agent with its socket.
-2. Gateway identifies A by `SO_PEERCRED`, confirms A lists B, B exports `backup.run`, and the link was approved.
-3. Effective capabilities for the call = A's ∩ B's (attenuation); user rights still apply through the worker.
-4. B executes; the audit record stores the full chain (user → A → B).
+The setup token regenerates on every panel restart for as long as no owner exists — this prevents a stale, previously-printed token from being valid indefinitely if the first setup attempt is abandoned.
 
-### 10.4 Enabling direct access
+### 6.2 Post-setup account creation (invite flow)
 
-1. Addon manifest declares scopes; a user with `addon.direct-access` opens the addon settings.
-2. polkit authorization for the action (prompting if required), then the **warning and legal notice** must be accepted.
-3. Grant, acknowledgement version/time, and expiry (if adopted) are recorded and audited; banner appears.
+Public self-registration is permanently disabled after the owner account is created. All subsequent accounts are created by an Admin or Owner:
 
----
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Panel
+    participant NewUser as New user
 
-## 11. Audit
+    Admin->>Panel: POST /api/users (email, username, role, resource limits)
+    Panel->>Panel: Create user row (password_hash = NULL)
+    Panel->>Panel: Create invites row, single-use token, TTL
+    Panel-->>Admin: Invite link
+    Admin->>NewUser: Share invite link (out of band)
+    NewUser->>Panel: GET /api/auth/invite/:token
+    NewUser->>Panel: POST /api/auth/invite/:token/activate (password and/or oauth/passkey)
+    Panel->>Panel: Set password_hash, consume invite token
+    Panel-->>NewUser: Redirect to /login
+```
 
-**Rule:** every action is audited, at both the master and the executing node.
+### 6.3 Login flow (password path)
 
-| Aspect | Design |
-|---|---|
-| Coverage | Every authenticated API call, addon call, polkit decision, login/logout, session expiry, grant, and direct-access event. High-volume streams are logged at channel open and close (with byte counts), not per message |
-| Fields | id, ts, node_id, actor_user, mapped_local_user, addon_id, call_chain, action, target, polkit_result, outcome, direct_mode, source_ip, session_id, prev_hash, hash |
-| Integrity | Hash-chained records, INSERT-only DB role, monthly partitions |
-| Node resilience | Node keeps a local append-only journal and forwards it to the master; buffered on disk when the master is unreachable and reconciled on reconnect |
-| Failure policy (recommended) | **Fail closed for mutating and privileged actions** if the audit record cannot be written; reads may buffer briefly |
-| Export | Optional forwarding to syslog/journald/remote store so a compromised host cannot rewrite history |
-| Retention | Configurable, default 90 days (assumption) |
-| Read access | Requires `org.serverpanel.audit.read` |
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Panel
+    participant Redis
 
----
+    Browser->>Panel: POST /api/auth/login (username, password)
+    Panel->>Panel: Rate-limit check (IP + username)
+    Panel->>Panel: Argon2id verify
+    alt TOTP enabled for user
+        Panel-->>Browser: 200, requires_2fa = true, temp challenge id
+        Browser->>Panel: POST /api/auth/login/2fa (challenge id, TOTP code)
+        Panel->>Panel: Verify TOTP
+    end
+    Panel->>Redis: Create session (user_id, role, permissions snapshot, csrf_token)
+    Panel-->>Browser: Set-Cookie session_id (HttpOnly, Secure, SameSite=Lax)
+    Panel-->>Browser: 200, csrf_token in body
+```
 
-## 12. Error Handling and Retry
+### 6.4 Credential mechanisms
 
-| Situation | Behavior |
-|---|---|
-| Worker crash | Detected via stdio closure; respawned on next request; in-flight calls return retryable `503 worker_unavailable` |
-| Addon crash | systemd restart with backoff; after N failures in a window, marked failed and admins notified |
-| Addon exceeds `MemoryMax` | OOM-killed within its cgroup; host unaffected; audited |
-| Capability denied | `403 capability_denied` naming the missing capability; audited |
-| Node offline | Master returns `503 node_unreachable`; UI shows node state; no long-lived command queue |
-| Node link drop | Node reconnects with backoff and jitter; channels resume where possible; terminal PTYs on the node persist |
-| Master DB unavailable | Master goes read-only/unavailable (fail closed); nodes keep running workloads and buffer audit |
-| Idle expiry mid-action | Long-running operations already started finish; new requests get `401 session_expired` |
-| Upload interrupted | Client resumes from last acknowledged chunk |
+| Mechanism | Storage | Notes |
+|---|---|---|
+| Password | Argon2id hash in `users.password_hash` | Never logged; never in access logs |
+| OAuth (Google/GitHub/Discord) | `oauth_identities` | Links to existing account via verified email; not a signup path |
+| Custom OIDC | `oidc_providers` + `oauth_identities` | Admin-configured issuer/client id/secret; arbitrary provider count |
+| Passkey (WebAuthn) | `webauthn_credentials` | Multiple per account; uses `go-webauthn/webauthn` |
+| TOTP 2FA | `totp_secrets`, `totp_backup_codes` | Secret encrypted at rest; backup codes hashed, single-use |
+| Forgot password | `password_resets` | Single-use, 15-30 min TTL; response never reveals email existence |
 
-Client retry guidance: retry only `503` and network errors, with exponential backoff and jitter, and only non-idempotent calls carrying an `Idempotency-Key`.
+### 6.5 Sessions
 
----
+- Redis-backed, opaque session ID cookie (`HttpOnly`, `Secure`, `SameSite=Lax`).
+- Web sessions: 1 hour idle timeout. Terminal/console sessions: **no idle timeout.**
+- Session payload: `{user_id, role_id, permissions[], permissions_version, csrf_token, created_at, last_seen_at}`.
+- Ban = `DEL session:<id>` for every session belonging to that user — instant, no token TTL to wait out. This is the deciding reason sessions were chosen over JWT.
 
-## 13. Scale and Reliability
+### 6.6 Rate limiting tiers
 
-### 13.1 Load estimation (assumptions)
+| Tier | Key | Limit shape |
+|---|---|---|
+| Auth endpoints | IP + username | Strict; exponential backoff, never a flat lockout |
+| Standard API | user or API key | Generous token bucket |
+| Expensive ops (create server, trigger install, bulk queries) | user | Stricter bucket |
+| Unauthenticated/public | IP | Tightest |
 
-- 20 admins × 1 WebSocket × ~4 channels ≈ 80 streams; aggregate well under 1 MB/s.
-- 100 nodes = 100 persistent mTLS connections plus heartbeats and metrics: comfortably handled by one Go process.
-- Audit volume: even at ~5 events/s sustained (peak admin activity including reads) is ~430k rows/day; partitioning and a 90-day default keep PostgreSQL small.
-- Per node: ~10 addons × 128 MB `MemoryHigh` ≈ 1.3 GB worst case; typical is far lower, and budgets are visible in the UI.
+Implemented as Redis-backed Lua scripts (atomic check-and-increment) behind Go middleware.
 
-### 13.2 Scaling and failover
+### 6.7 Cookie consent
 
-- **v1:** one master (or standalone), vertical scaling. The master link is stateless enough to restart quickly, since sessions and grants live in PostgreSQL.
-- systemd `Restart=on-failure` for gateway, agent, and helper.
-- **Master down:** managed workloads are unaffected, but management is unavailable and node audit buffers on disk. The panel being down never stops what it manages.
-- **Later:** active/passive master with a PostgreSQL replica.
+The session cookie is strictly necessary and must never be gated behind consent. The consent banner governs only genuinely optional cookies (analytics). Declining consent must never break login.
 
-### 13.3 Upgrades and version skew
+## 7. RBAC
 
-- Masters and nodes upgrade independently, so the link protocol is **versioned with negotiation**, and masters support at least the previous node version (N-1).
-- Database migrations run at master/standalone upgrade with a documented backup-first step.
+### 7.1 Roles
 
-### 13.4 Monitoring
+| Role | Cardinality | Notes |
+|---|---|---|
+| Owner | exactly 1, DB-enforced | Unrestricted; fixed access to all resources on all nodes, not editable |
+| Admin | many | Management + novelty features; add/delete/deactivate nodes, users, templates; ban users; edit normal users' resource limits |
+| User | many | Own servers/resources only |
+| Custom | many | Owner/Admin can define new roles with an arbitrary permission set |
 
-- Structured logs to journald; `/metrics` (Prometheus) on a local socket or loopback: requests, errors, sessions, connected nodes, per-addon cgroup CPU/memory, capability denials, audit write failures.
-- `/healthz` and `/readyz` (PostgreSQL reachable, helper reachable, node link up).
-- Suggested alerts: node offline, addon crash loops, `capability_denied` spikes, direct access enabled, audit failure, certificate near expiry.
+### 7.2 Example permission keys
 
----
+```
+server.create
+server.delete
+server.start
+server.stop
+server.manage_any        -- bypasses per-server ownership check (owner/admin)
+node.create
+node.delete
+node.manage
+user.create
+user.ban
+user.edit_limits
+template.create
+template.delete
+backup.create
+backup.restore
+```
 
-## 14. Threat Model (summary)
+### 7.3 Permission resolution
+
+```mermaid
+flowchart TD
+    A["Incoming request, user + resource"] --> B{"Role has required permission?"}
+    B -- yes --> D["Allowed"]
+    B -- no --> C{"server_grants row exists for this user+resource with the needed permission?"}
+    C -- yes --> D
+    C -- no --> E["403 Forbidden"]
+```
+
+Role permission set is cached in the Redis session at login. A `role:<id>:version` counter (bumped on every role edit) is checked on each request — a mismatch triggers a cheap re-resolve from Postgres, so permission edits take effect on the user's very next request without a DB hit on every single call.
+
+## 8. API design principles
+
+- Same-origin: frontend at `/`, API at `/api/*`, no version prefix.
+- Middleware chain, in order: session resolution → CSRF check (mutating methods only) → permission check (declarative per route) → handler-level ownership check (resource-specific, can't be generic middleware).
+- CSRF: synchronizer token — generated at login, stored server-side in the session, returned once to the client, sent back as `X-CSRF-Token` on every mutating request.
+- All mutating handlers must be idempotent-safe where retried (idempotency keys on install-trigger requests specifically).
+- Every request that changes state writes an `audit_log` row: actor, action, target, metadata.
+
+## 9. API reference (endpoint catalog)
+
+### 9.1 Auth
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/api/auth/setup` | First-run owner creation (only reachable pre-owner) |
+| POST | `/api/auth/login` | Password login, step 1 |
+| POST | `/api/auth/login/2fa` | TOTP verification, step 2 |
+| POST | `/api/auth/logout` | Destroy current session |
+| POST | `/api/auth/forgot-password` | Request reset email |
+| POST | `/api/auth/reset-password/:token` | Complete reset |
+| GET | `/api/auth/invite/:token` | Fetch invite details (email, role) |
+| POST | `/api/auth/invite/:token/activate` | Set password / link credential, activate account |
+| GET | `/api/auth/oauth/:provider/start` | Begin OAuth redirect |
+| GET | `/api/auth/oauth/:provider/callback` | OAuth callback, link to existing account |
+| POST | `/api/auth/webauthn/register/start` | Begin passkey registration |
+| POST | `/api/auth/webauthn/register/finish` | Complete passkey registration |
+| POST | `/api/auth/webauthn/login/start` | Begin passkey login |
+| POST | `/api/auth/webauthn/login/finish` | Complete passkey login |
+| POST | `/api/auth/totp/enroll` | Begin TOTP enrollment, returns secret + backup codes |
+| POST | `/api/auth/totp/confirm` | Confirm enrollment with a valid code |
+| GET | `/api/me` | Current user, role, permissions, csrf token |
+
+### 9.2 Users & roles
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/users` | List users (admin+) |
+| POST | `/api/users` | Create user + invite (admin+) |
+| PATCH | `/api/users/:id` | Edit user (role, limits) |
+| POST | `/api/users/:id/ban` | Ban user, kills all sessions |
+| POST | `/api/users/:id/unban` | Unban |
+| DELETE | `/api/users/:id` | Delete user |
+| GET | `/api/roles` | List roles |
+| POST | `/api/roles` | Create custom role |
+| PATCH | `/api/roles/:id/permissions` | Edit role's permission set, bumps version |
+
+### 9.3 Locations & nodes
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/locations` | List locations |
+| POST | `/api/locations` | Create location |
+| GET | `/api/nodes` | List nodes |
+| POST | `/api/nodes` | Create node, returns setup link + bootstrap token |
+| GET | `/api/nodes/:id` | Node detail, live resource usage |
+| PATCH | `/api/nodes/:id` | Edit caps/toggles |
+| DELETE | `/api/nodes/:id` | Deactivate/delete node |
+| GET | `/nodes/setup/:shortname` | Node-facing bootstrap endpoint (not browser-facing) |
+
+### 9.4 Templates
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/templates` | List templates |
+| POST | `/api/templates` | Upload `.tmz` file or submit interactive-builder JSON |
+| GET | `/api/templates/:id` | Template detail |
+| DELETE | `/api/templates/:id` | Delete template |
+
+### 9.5 Servers
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/servers` | List current user's servers (or all, for admin+) |
+| POST | `/api/servers` | Create server (template, resources, backend choice) |
+| GET | `/api/servers/:id` | Server detail, status, usage |
+| POST | `/api/servers/:id/start` | Start |
+| POST | `/api/servers/:id/stop` | Graceful stop |
+| POST | `/api/servers/:id/kill` | Force kill |
+| POST | `/api/servers/:id/restart` | Restart |
+| POST | `/api/servers/:id/reinstall` | Re-run install |
+| DELETE | `/api/servers/:id` | Delete |
+| PATCH | `/api/servers/:id` | Rename, description |
+| POST | `/api/servers/:id/grants` | Grant another user access (console, etc.) |
+| DELETE | `/api/servers/:id/grants/:userId` | Revoke |
+| PATCH | `/api/servers/:id/ports` | Switch dynamic to static, if permitted |
+| POST | `/api/servers/:id/console/ticket` | Mint single-use console WS ticket |
+
+### 9.6 Files
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/servers/:id/files` | List directory (`?path=`) |
+| GET | `/api/servers/:id/files/download` | Stream file down (`?path=`) |
+| POST | `/api/servers/:id/files/upload` | Stream file up (`?path=`) |
+| POST | `/api/servers/:id/files/rename` | `{from, to}` |
+| POST | `/api/servers/:id/files/delete` | `{path}` |
+| POST | `/api/servers/:id/files/mkdir` | `{path}` |
+| POST | `/api/servers/:id/files/archive` | `{paths[], format}` |
+| POST | `/api/servers/:id/files/extract` | `{path}` |
+
+### 9.7 Backups & databases
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/servers/:id/backups` | List backups |
+| POST | `/api/servers/:id/backups` | Create backup, `{destination_type, destination_id}` |
+| POST | `/api/backups/:id/restore` | Restore |
+| DELETE | `/api/backups/:id` | Delete |
+| GET | `/api/database-hosts` | List db hosts (admin+) |
+| POST | `/api/database-hosts` | Register db host (admin+) |
+| GET | `/api/servers/:id/databases` | List server's databases |
+| POST | `/api/servers/:id/databases` | Provision a database |
+| DELETE | `/api/servers/:id/databases/:dbId` | Delete |
+
+### 9.8 Scheduler
+
+| Method | Path | Description |
+|---|---|---|
+| GET | `/api/servers/:id/schedules` | List schedules |
+| POST | `/api/servers/:id/schedules` | Create, body is the `.tmz.sc` graph |
+| PATCH | `/api/schedules/:id` | Edit, bumps version, re-pushes to guest |
+| DELETE | `/api/schedules/:id` | Delete |
+| GET | `/api/schedules/:id/runs` | Run history |
+
+## 10. Locations & Nodes
+
+Locations are created first: unique short-name, free-text general name, country. Nodes are created under a Location, carrying: name, hard resource caps (CPU/GPU/RAM/storage — enforced by the daemon regardless of the machine's real hardware), Docker/VM capability toggles, FQDN/IP, a unique shortname (used for port-allocation namespacing), SSL toggle, SFTP port, panel-connection port, and a behind-proxy flag.
+
+Locations currently serve two known purposes — node grouping, and backup destination selection (§21) — other uses are explicitly open **[OPEN]**.
+
+## 11. Node bootstrap handshake
+
+```mermaid
+sequenceDiagram
+    participant Admin
+    participant Panel
+    participant Node as New node daemon
+
+    Admin->>Panel: POST /api/nodes (caps, location, fqdn, etc.)
+    Panel->>Panel: Create node row, status=pending
+    Panel->>Panel: Generate single-use bootstrap token, store hash + TTL
+    Panel-->>Admin: Setup link + install command (embeds token)
+    Admin->>Node: Run install command on the machine (out of band)
+    Node->>Panel: GET /nodes/setup/:shortname (presents token)
+    alt token valid, unexpired, unconsumed
+        Panel->>Panel: Issue long-lived credential: mTLS client cert or signed node token
+        Panel-->>Node: Connection details + credential
+        Node->>Node: Persist credential to env file
+        Panel->>Panel: Consume bootstrap token, mark node status=online
+    else invalid / expired / already consumed
+        Panel-->>Node: 403 Forbidden
+    end
+```
+
+The security property here is **possession of a secret**, not "verifying the machine" — HTTP alone cannot prove machine identity, especially behind NAT/proxy, both supported cases. The bootstrap token is single-use specifically so a leaked or guessed setup URL cannot be raced by an attacker after the real node has already claimed it.
+
+## 12. Panel ↔ Node control channel protocol
+
+One persistent WSS connection per node, opened by the panel to the node, authenticated with the long-lived credential from the bootstrap handshake — not per-message auth.
+
+### 12.1 Message envelope
+
+```json
+{
+  "id": "req-<uuid>",
+  "type": "server.start",
+  "server_uuid": "...",
+  "payload": {}
+}
+```
+
+Responses correlate by `id`:
+
+```json
+{
+  "id": "req-<uuid>",
+  "type": "response",
+  "status": "ok",
+  "payload": {}
+}
+```
+
+Unsolicited events carry no `id`:
+
+```json
+{
+  "type": "event.status",
+  "server_uuid": "...",
+  "payload": { "cpu_pct": 12.4, "ram_mb": 512, "state": "running" }
+}
+```
+
+### 12.2 Message type catalog
+
+| Type | Direction | Purpose |
+|---|---|---|
+| `server.provision` | panel to node | Resolved create-server instruction (template + variables + resources) |
+| `server.start` / `.stop` / `.kill` / `.restart` | panel to node | Lifecycle control |
+| `server.delete` | panel to node | Teardown + volume cleanup |
+| `event.status` | node to panel | Periodic heartbeat/usage |
+| `event.install_log` | node to panel | Streamed install output |
+| `event.install_result` | node to panel | Success/failure at end of install |
+| `node.heartbeat` | node to panel | Liveness + aggregate resource usage |
+| `tmz.update_flag` | node to panel | A server has been flagged need-to-update-tmz |
+
+### 12.3 Data channels (separate from control)
+
+- **Console**: per-session WS, authorized by a single-use ticket (see §19), never shares the control channel.
+- **File transfer**: per-upload/download stream, so a large transfer never blocks lifecycle/status traffic for other servers on the same node.
+
+## 13. Backends: Docker & VM
+
+Both backends are Go packages compiled into the daemon (not runtime-loaded plugins), toggled per node via `docker_enabled` / `vm_enabled`. A template declares exactly one target backend; the panel routes provisioning requests to the matching node capability.
+
+| Aspect | Docker | VM |
+|---|---|---|
+| Base | Pulled/pre-cached image | One of the node's hardcoded base VM configs |
+| Provisioning mechanism | Install container | cloud-init |
+| Volume access while running | Bind mount | virtiofs (9p fallback) |
+| tmz binary swap while stopped | Direct filesystem access | Offline disk tooling (e.g. libguestfs-style mount) |
+| Startup command execution | via tmz inside container | via tmz inside guest |
+
+## 14. Image templates (`.tmz`)
+
+Format: plain JSON (after iterating through systemd/INI-style and NestedText during design), parsed into Go structs. One template targets exactly one backend.
+
+### 14.1 Docker template shape (illustrative)
+
+```json
+{
+  "meta": {
+    "name": "example-app",
+    "backend": "docker",
+    "version": 1,
+    "author": "..."
+  },
+  "variables": [
+    { "key": "PORT", "type": "int", "default": 8080, "required": true },
+    { "key": "MEMORY_LIMIT", "type": "int", "default": 1024, "required": false }
+  ],
+  "docker": {
+    "install_image": "ubuntu:22.04",
+    "runtime_image": "example-app:latest",
+    "install_commands": [
+      "apt-get update && apt-get install -y curl",
+      "curl -Lo /data/app.tar.gz https://example.com/app.tar.gz",
+      "tar -xzf /data/app.tar.gz -C /data"
+    ],
+    "startup_command": "/data/app --port={{PORT}}",
+    "expected_install_time_seconds": 120,
+    "benchmarked_specs": { "cores": 4, "ram_mb": 4096, "storage_mbps": 200, "net_mbps": 100 }
+  }
+}
+```
+
+### 14.2 VM template shape (illustrative)
+
+```json
+{
+  "meta": { "name": "example-vm", "backend": "vm", "version": 1 },
+  "variables": [
+    { "key": "HOSTNAME", "type": "string", "default": "server", "required": true }
+  ],
+  "vm": {
+    "base_config": "ubuntu-22.04-cloudimg",
+    "cloud_init_commands": [
+      "apt-get update && apt-get install -y nginx",
+      "hostnamectl set-hostname {{HOSTNAME}}"
+    ],
+    "startup_command": "systemctl start example-service",
+    "expected_install_time_seconds": 300
+  }
+}
+```
+
+## 15. Install process
+
+### 15.1 Docker install flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Panel
+    participant Node
+    participant Install as Install container
+    participant Runtime as Runtime container
+
+    User->>Panel: Create server
+    Panel->>Panel: Resolve template variables, check node capacity
+    Panel->>Node: server.provision (resolved instruction)
+    Node->>Install: Start install container, volume-only mount, network on, capabilities dropped, non-root
+    Install-->>Node: stdout/stderr, live
+    Node-->>Panel: event.install_log (streamed)
+    alt success within timeout
+        Node->>Install: Destroy install container
+        Node->>Runtime: Start runtime container, tmz starts, runs startup_command
+        Node-->>Panel: event.install_result (success)
+    else timeout or nonzero exit
+        Node-->>Panel: event.install_result (failure)
+        Panel-->>User: leave / delete / retry (max 3 attempts)
+    end
+```
+
+### 15.2 Install timeout scaling
+
+- Base: `expected_install_time_seconds` from the template, benchmarked against `benchmarked_specs`.
+- Scaled against the actual node's specs, weighted toward whichever resource the install is primarily bound by (network / CPU / disk / mixed) rather than one blended ratio.
+- Safety multiplier (~1.3-1.5x) applied on top of the scaled estimate.
+- Hard floor and ceiling regardless of scaling result.
+- **Absolute hard cap: 2 hours by default**, adjustable by admins.
+
+### 15.3 Failure handling
+
+Three options presented to the user on failure: leave unfinished, delete, or retry. Retries capped at 3 attempts; the volume is wiped before each retry unless a template explicitly opts into resumable installs.
+
+## 16. Server lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> installing: POST /api/servers
+    installing --> running: install succeeds, startup_command runs
+    installing --> install_failed: install fails
+    install_failed --> installing: retry (up to 3)
+    install_failed --> [*]: delete
+    running --> stopped: stop / kill
+    stopped --> running: start
+    stopped --> [*]: delete
+    running --> [*]: delete (force)
+```
+
+Fields shown on server creation depend on the Docker/VM choice and are matched against the selected template's declared `variables`. VM creation is opt-in per user (`resource_limits.vm_creation_allowed`) — the Owner has it by default, everyone else must be explicitly granted it.
+
+## 17. Port allocation
+
+- Each node has a configured range (`port_range_start`/`port_range_end`).
+- Dynamic allocation (default): pick the next free port in range for the node.
+- Static allocation: an admin/owner can grant a specific user a fixed port for a given server.
+- Reservation must be atomic — a DB transaction or a Postgres advisory lock on the node row — to avoid two simultaneous server creations racing onto the same port.
+
+## 18. `tmz` — the in-guest agent
+
+### 18.1 Role
+
+A single Go binary, cross-compiled per architecture by the panel, installed by default at a fixed path inside every container/VM. Described explicitly as an **orchestrator, not a thin bridge**:
+
+- Executes the startup command on boot (uniform across Docker and VM backends).
+- Executes scheduled jobs locally, inside the guest.
+- Handles power-action requests originating from inside the guest.
+- Delivers customization data pushed from the node (PS1, shebangs, autocomplete history).
+
+### 18.2 Transport
+
+After a server starts, a listener on a fixed port (currently 38411) runs inside that server's own **isolated network** — reusable across every server since each server's network is isolated from every other server and from the outside world. `tmz` connects **out** to this port.
+
+Isolation must be structurally real:
+- Docker: one dedicated network per container, not a shared bridge relying on ICC rules.
+- VM: one dedicated bridge/tap per VM.
+
+**Identity is bound to the channel, never to a self-reported field.** The node already knows which isolated network maps to which server UUID from provisioning time.
+
+### 18.3 Trust boundary (explicit invariant)
+
+`tmz` must never be able to send arbitrary code to the host or otherwise become a breach path outward. It can only:
+1. Receive code/instructions from the host to execute inside the guest (startup command, scheduled job payload).
+2. Make requests to the host from a small, closed, hardcoded enum — never a generic type-to-executor mapping.
+
+```mermaid
+flowchart LR
+    Node -- "push: startup command, scheduled job payload, customization data" --> TMZ["tmz"]
+    TMZ -- "allow-listed requests only:<br/>req stop, req restart, fetch-customization" --> Node
+    TMZ -. "NEVER: arbitrary code to host" .-x Node
+```
+
+Every request type is validated against the closed enum and rate-limited per type per server.
+
+### 18.4 Update flow
+
+```mermaid
+flowchart TD
+    A["New central tmz binary available on node"] --> B{"Server running?"}
+    B -- no --> C["Detach volume, atomic write-to-temp then rename, done"]
+    B -- yes --> D["Set need-to-update-tmz flag"]
+    D --> E{"Server stops"}
+    E --> C
+    F["Stop+Start race while replace in progress"] --> G["Guided/blocking: replace must fully complete before start is processed"]
+```
+
+Docker vs VM asymmetry: a stopped container's filesystem is directly host-reachable; a stopped VM's disk needs offline disk tooling as its own code path.
+
+## 19. Console
+
+- PTY-based, genuine SSH-like session — commands typed directly into the terminal.
+- Embedded inline in the dashboard (not a popup or iframe).
+- Autocomplete from the user's own past command history, delivered via tmz's customization channel.
+- Side panel: force-kill, graceful-kill, restart — replaced by a Start button once killed. Live usage stat cards/graphs below.
+- Owner cannot open another user's console without that user granting permission (via `server_grants`), but can still delete/suspend regardless.
+
+```mermaid
+sequenceDiagram
+    participant Browser
+    participant Panel
+    participant Node
+    participant Guest
+
+    Browser->>Panel: POST /api/servers/:id/console/ticket (full auth chain)
+    Panel->>Panel: Mint single-use ticket, short TTL, store in Redis
+    Panel-->>Browser: ticket
+    Browser->>Panel: WSS /console/ws?ticket=...
+    Panel->>Panel: Validate + consume ticket
+    Panel->>Node: Open data-channel proxy for this server's PTY
+    Node->>Guest: Attach to tmz-managed PTY
+    Guest-->>Browser: Live terminal I/O, proxied through
+```
+
+## 20. File management
+
+- Feature set: browse, upload, download, extract, zip, rename, move — plus direct SFTP access to the volume.
+- VM filesystems stay live-accessible the whole time the VM is running via **virtiofs** (9p as an older-guest fallback) — never by touching a live VM's raw disk image from the host directly.
+- This unifies the Docker and VM code paths: both resolve "a server's volume" to an ordinary directory on the node's own filesystem (bind-mount for Docker, virtiofs-shared for VM) — one file-manager implementation, one SFTP server implementation, no backend-specific branching.
+- Path traversal defense enforced independently on both the panel and the node (canonicalize, reject `..`, verify the resolved path stays within the server's designated data directory) — never relying on a single layer as the only defense.
+
+## 21. Backups
+
+- Storage: S3-compatible bucket.
+- At creation time, the user selects either a **Location** (nearest/appropriate node in that location handles it) or a **specific node** directly.
+- Mechanism differs by backend **[OPEN]**: Docker backups can be a straightforward archive of the data directory; a VM backup likely needs a proper qcow2 snapshot (internal or external-with-backing-file) to capture full guest/OS state rather than just the shared data directory. Final call pending.
+
+## 22. Databases (user-facing hosting)
+
+Distinct from the panel's own Postgres. A **Database Host** is registered once (admin), then per-server "create database" requests provision a scoped user+schema on it, with credentials surfaced (and rotatable) to the server owner. Structurally similar to how Nodes are managed.
+
+## 23. Scheduler (`.tmz.sc`)
+
+### 23.1 Model
+
+A directed graph — blocks are nodes, connections are edges, branching on success/failure/condition — not a flat linear list. Execution happens **inside the guest, via tmz**, which is what lets scheduling generalize uniformly across Docker and VMs and keeps schedules running through brief panel/node outages.
+
+### 23.2 Illustrative shape
+
+```json
+{
+  "meta": { "name": "nightly-backup", "version": 3 },
+  "blocks": {
+    "start": { "type": "start", "next": "take_backup" },
+    "take_backup": { "type": "action.backup", "next": "restart_server" },
+    "restart_server": {
+      "type": "action.restart",
+      "on_success": "done",
+      "on_failure": "notify_fail"
+    },
+    "notify_fail": { "type": "action.notify", "next": "done" },
+    "done": { "type": "end" }
+  },
+  "functions": {
+    "cleanup_old_backups": {
+      "params": ["keep_count"],
+      "blocks": { "...": "..." }
+    }
+  },
+  "settings": {
+    "trigger": "cron:0 3 * * *",
+    "retry_on_fail": 3,
+    "when": "lastRunStatus == 'failed' && retryCount < 3"
+  }
+}
+```
+
+The outer structure (blocks/functions/settings) is plain JSON parsed by the panel's own structures. Condition/argument expressions (the `when` field, function call arguments) are evaluated at runtime via a small embeddable Go expression evaluator layered on top of the parsed structure — not a hand-rolled parser — while the outer JSON shape stays custom.
+
+### 23.3 Edit/push flow
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Panel
+    participant Node
+    participant Guest
+
+    User->>Panel: PATCH /api/schedules/:id (new graph)
+    Panel->>Panel: Bump schedules.version
+    Panel->>Node: control-channel push: new schedule version
+    Node->>Guest: Deliver to tmz over port 38411
+    Guest-->>Node: ack
+    Node-->>Panel: ack
+    Panel->>Panel: Set schedules.ack_at
+```
+
+## 24. Assets / CDN
+
+Static assets served under an `/assets` route on the panel's own domain, or optionally a separate subdomain, functioning like a lightweight CDN. Hashed filenames get long immutable cache headers; `index.html`/unhashed HTML gets no-cache.
+
+## 25. Addons (deferred)
+
+- Addon UI: plain HTML/CSS/JS/TS, running its logic as its own sandboxed, burstable process talking to the Go API from inside the sandbox.
+- Direct-access permissions are a hard limit by default; an addon must declare a special tag to request elevated access, and the user must accept an explicit warning/legal notice to grant it.
+- An addon is either embedded in the panel or a separate site alongside it, declared in its manifest; the manifest's UI API must be disabled to use fully custom components.
+- Addons interact with each other only if one explicitly lists the other as a dependency.
+- Full design deferred to a later pass.
+
+## 26. Threat model summary
 
 | Threat | Mitigation |
 |---|---|
-| Gateway compromised | Unprivileged; helper surface tiny and socket-restricted; work is done by per-user workers |
-| **Master compromised** | Assertions are short-lived and audience-bound; non-root mappings by default; node-side polkit and audit; nodes never accept unsigned commands. Residual risk is real: the master is the fleet's crown jewel, so harden and isolate it |
-| Node certificate stolen | Short-lived certs, immediate revocation, master pins certificate fingerprints |
-| Addon UI steals session or hits panel API | UI API mode ships no addon JS; custom mode uses isolated origin/sandboxed iframe, scoped tokens, per-addon CSP |
-| Addon backend escapes | systemd sandbox, unique uid, seccomp, no network by default, cgroup limits |
-| Addon impersonates another | `SO_PEERCRED` identification, not self-declared names |
-| **Capability laundering via dependencies** | Attenuation (intersection) by default; approved links only; chain audited |
-| Confused deputy | Actions run as the user's uid; capability gate only narrows |
-| Malicious update widens power | Re-approval on capability/dependency change; signatures |
-| Direct access abused | Protected resources, audit flag, optional expiry and banner; still the user's uid |
-| Abandoned terminal | Terminal lease timeouts (configurable), tie to user; visible list of open terminals |
-| Credential theft / brute force | PAM only, no password storage, login throttling and lockout, secure cookies |
-| CSRF / XSS | `SameSite=Strict`, CSRF tokens, `Origin` checks, strict shell CSP, escaped log output |
-| polkit misconfiguration | Ship conservative default `.policy`/`.rules`; `panel doctor` command to flag risky rules |
-| Tampered audit log | INSERT-only DB role, hash chain, external export |
-| Tarball tampering | Published checksums and detached signature; installer verifies before install |
+| Compromised guest tries to control the node/host | tmz's closed request enum; identity bound to isolated network channel, not self-reported field |
+| Compromised guest tries to reach another server's guest | Per-server dedicated Docker network / VM bridge, not a shared bridge with ICC rules |
+| Node setup URL guessed/intercepted before real node claims it | Single-use, time-limited bootstrap token separate from the shortname |
+| Session/cookie theft | HttpOnly/Secure/SameSite cookie; console access additionally uses single-use short-TTL tickets, never the raw session on a WS URL |
+| CSRF | Synchronizer token, required on all mutating requests |
+| Credential stuffing / brute force | Rate limiting keyed by IP and username together, exponential backoff, never a flat lockout |
+| IDOR (acting on another user's resource) | Handler-level ownership check on every resource-scoped endpoint, independent of route-level auth |
+| Path traversal in file manager | Canonicalize and validate on both panel and node independently |
+| Stale permissions after a role edit | `role:<id>:version` counter checked per request, cheap re-resolve on mismatch |
+| Interrupted tmz binary replace corrupting the agent | Atomic write-to-temp-then-rename, never in-place overwrite |
+| Live VM disk corruption from host-side file access | virtiofs/9p live-share instead of ever touching the raw disk image directly |
+| Node oversubscription past declared caps | Capacity check against `node_resource_usage` before accepting a create-server request |
 
----
+## 27. Open questions
 
-## 15. Packaging, Distribution, and Licensing
+- **VM backup mechanism**: full-disk snapshot vs. data-directory-only (§21).
+- **Kubernetes / bare-metal**: out of scope for now, revisit later if needed.
+- **Automatic node placement**: deferred in favor of manual placement.
+- **Scheduler expression library**: needs a concrete choice (e.g. an existing embeddable Go expression evaluator) for `when`/argument fields.
+- **Locations' full purpose**: currently node grouping + backup destination; other uses left open.
+- **Addon system**: full design not yet started.
+- **Go library support for any remaining bespoke serialization needs**: verify availability before committing further to hand-rolled parsers beyond what's already decided (JSON for `.tmz`/`.tmz.sc`).
 
-### 15.1 Tarball
+## 28. Glossary
 
-```
-serverpanel-<version>-linux-<arch>.tar.gz
-├── bin/          # serverpanel (single binary; mode chosen by config), serverpanel-helper, panel-addon CLI
-├── share/        # polkit .policy and default .rules, systemd unit templates, migrations
-├── etc/          # example config per mode (standalone, master, node)
-├── install.sh    # creates users/dirs, installs units and polkit files, checks prerequisites
-├── LICENSE       # GPL v2
-└── SHA256SUMS + signature
-```
-
-- Static Go binaries for amd64 and arm64.
-- `install.sh` needs root, verifies systemd, D-Bus, polkit, and (for standalone/master) a reachable PostgreSQL; it does not install PostgreSQL itself.
-- Mode is a config setting (`mode = standalone | master | node`); `serverpanel enroll <master-url> <token>` handles node enrollment.
-- Upgrades: replace binaries, run migrations on master/standalone, restart units. Package-manager repos are a later option.
-
-### 15.2 License: GNU GPL v2
-
-Two things to decide, because they affect what you can ship:
-
-1. **"only" vs "or later".** As far as I know, Apache-2.0 code is not compatible with GPL-2.0-*only*. Many Go libraries are Apache-2.0 (for example `coreos/go-systemd`). GPL-2.0-*or-later* avoids this, because the combined work can be distributed under GPLv3, which is Apache-compatible. Alternatively avoid Apache-2.0 dependencies. Audit the dependency list before choosing.
-2. **Addons and SDKs.** Addons are separate processes talking over sockets and HTTP, which is generally treated as arm's-length, but any SDK library that addons *link* is covered by the SDK's license. Consider a permissive license (MIT/BSD) or a linking exception for SDKs so proprietary addons remain possible.
-
-I'm not a lawyer; have this reviewed.
-
-Also note the panel's GPL license and the direct-access legal notice serve different purposes; the notice is about user consent, not licensing.
-
----
-
-## 16. Decisions and Trade-offs
-
-| # | Decision | Alternatives | Rationale | Cost |
-|---|---|---|---|---|
-| D1 | Go backend | Bun/Node | D-Bus, PTY, systemd ecosystem; static binaries | Team must know Go |
-| D2 | **Go server-side renders the UI** | Astro SSR, static SPA | Single runtime, no extra hop, fits uploads/websockets, matches node/master model | Astro cannot be hosted by Go (its SSR needs a JS runtime), so its role changes (open question 1) |
-| D3 | Gateway/helper/worker split | Single root daemon | Limits blast radius | More IPC |
-| D4 | Work runs as the user's uid | App-level checks in a root process | Kernel enforces rights | Per-session workers |
-| D5 | Addons as sandboxed processes | In-process plugins, WASM | Language freedom, real limits | More overhead per addon |
-| D6 | Two UI modes, mutually exclusive | Single UI model | Safe default (UI API) plus escape hatch (custom) | Two paths to test |
-| D7 | Embedded or site presentation | Embedded only | Flexibility for large addons | Host/port/TLS routing complexity |
-| D8 | **PostgreSQL** | SQLite | Concurrency, INSERT-only audit role, master scale | Extra service to install and back up; heavier for a one-host standalone install |
-| D9 | Three modes in one binary | Separate products | One codebase, one protocol | Mode-specific code paths and testing matrix |
-| D10 | Nodes dial out over mTLS | Master dials nodes | NAT/firewall friendly, no inbound port on nodes | Master must be reachable; long-lived connections |
-| D11 | Identity assertions + local mapping | Forward credentials; run all as root | No password leaves master; least privilege | Mapping admin burden; master compromise impact |
-| D12 | polkit for roles and privileged actions | Custom RBAC | Native to systemd/D-Bus, admins already know it | polkit rule language and agent complexity |
-| D13 | Dependencies gate addon-to-addon calls, with attenuation | Open inter-addon access | Prevents laundering, explicit graph | Dependency resolution work |
-| D14 | Terminal exempt from idle expiry | Same timeout as web | Long-running interactive work | Risk of abandoned root-capable shells; mitigated by leases and configurable timeouts |
-| D15 | Rely fully on systemd/D-Bus | Distro-agnostic | Less code, consistent behavior | Excludes non-systemd systems |
-| D16 | Tarball distribution | Distro packages, containers | Simple, uniform | Manual upgrades until repos exist |
-
----
-
-## 17. Delivery Plan
-
-| Milestone | Scope | Exit criteria |
-|---|---|---|
-| **M0** Skeleton | Repo, Go SSR shell, TLS, config with `mode`, OpenAPI stub, CI, tarball build | Panel loads over TLS in standalone mode |
-| **M1** Auth and core | Helper with PAM, workers, sessions in PostgreSQL, 1-hour idle expiry, units list/restart, audit v1. **Design the worker protocol transport-agnostic now** so it can later run over the node link | Log in, restart a unit, expire idle session, see audit rows |
-| **M2** polkit | Panel `.policy`, `CheckAuthorization`, auth agent, admin-only actions | Non-admin denied, admin prompted and allowed |
-| **M3** Streaming | Channel protocol, logs, metrics | Live logs with reconnect |
-| **M4** Terminal and files | PTY channel with leases, files, resumable transfer | Terminal survives session expiry; 5 GB upload resumes |
-| **M5** Addon runtime | Manifest, transient-unit sandbox, socket API, capability checks | Permitted call succeeds, non-permitted denied and audited |
-| **M6** Addon UI | UI API mode first, then custom mode with isolation, tokens, SDK; embedded and site presentation | Custom addon cannot read panel cookies or reach non-addon routes (tested) |
-| **M7** Master and node | Enrollment, mTLS link, assertions, identity mapping, relay, node audit journal | Restart a unit on a node from the master UI; node refuses forged assertion |
-| **M8** Dependencies and direct access | Dependency graph, attenuation, direct-access flow with legal notice | Laundering attempt blocked; protected resources unreachable |
-| **M9** Supply chain and hardening | Signing, re-approval, security review, fuzzing helper/gateway/link, isolation pen-test | Findings triaged and closed |
-| **Later** | Master HA, addon egress proxy, registry, more modules | n/a |
-
-The riskiest assumptions to validate early are the two-gate model with origin isolation (M5–M6) and the master-to-node identity model (M7).
-
----
+| Term | Meaning |
+|---|---|
+| Panel | The central Go backend + Astro frontend; source of truth |
+| Node | A managed machine running the daemon |
+| Daemon | The Go binary running on a Node |
+| tmz | The narrow in-guest agent running inside every container/VM |
+| Location | A grouping of Nodes (datacenter/region) |
+| Template (`.tmz`) | A JSON file describing how to provision a Docker or VM server |
+| Schedule (`.tmz.sc`) | A JSON graph describing recurring/conditional jobs for a server |
+| Install container | An ephemeral, volume-scoped container that runs a Docker template's install steps |
+| Resource grant | A per-user, per-server permission independent of role (e.g. shared console access) |
